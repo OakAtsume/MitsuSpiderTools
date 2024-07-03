@@ -1,6 +1,6 @@
-require("net/http")
-require("uri")
-require("securerandom")
+require "net/http"
+require "uri"
+require "securerandom"
 
 class Spider
   def initialize(url: nil, inbound: true)
@@ -11,6 +11,7 @@ class Spider
       "Mozilla/5.0 (BlackBerry; U; BlackBerry 9900; en) AppleWebKit/534.11+ (KHTML, like Gecko) Version/7.1.0.346 Mobile Safari/534.11+",
       "Mozilla/5.0 (BlackBerry; U; BlackBerry 9800; zh-TW) AppleWebKiwt/534.8+ (KHTML, like Gecko) Version/6.0.0.448 Mobile Safari/534.8+",
     ]
+
     @Agent = @UserAgents.sample
     @Urls = []
     @Visited = []
@@ -35,13 +36,13 @@ class Spider
       mp4
       mp3
     ]
+    @FileInclusionRegex = /(?i)[^\n]{0,100}(no such file|failed (to )?open)[^\n]{0,100}/
 
     log(level: :info, message: "No URL provided? (what r u trying to do bro)") if url.nil?
   end
 
   def log(level: :info, message: "", msg: "", code: nil)
     timestamp = Time.now.strftime("%H:%M:%S")
-    # alignment = "\t" * (3 - level.to_s.length / 4)
     case level
     when :info
       puts("\e[32m[INFO]\e[0m [#{timestamp}] #{message}")
@@ -94,7 +95,9 @@ class Spider
   def fetch(uri, headers: {}, parameters: {})
     request = Net::HTTP::Get.new(uri)
     request["User-Agent"] = @Agent
-    request["Cookie"] = @Cookies.map { |k, v| "#{k}=#{v}" }.join("; ")
+    if @Cookies.any?
+      request["Cookie"] = @Cookies.map { |k, v| "#{k}=#{v}" }.join("; ")
+    end
     headers.each { |k, v| request[k] = v }
     request.set_form_data(parameters) if parameters.any?
 
@@ -120,6 +123,80 @@ class Spider
   end
 
   attr_accessor :target, :targetUrl, :Urls, :Visited, :Cookies, :Intresting, :IgnoreList
+
+  def perform_checks(uri, params)
+    params.each do |param|
+      reflect_payload = SecureRandom.hex(10)
+      new_uri = uri.dup
+      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, reflect_payload] : [k, v] })
+      request = fetch(new_uri)
+      if request.code == "200" && request.body.include?(reflect_payload)
+        log(level: :info, message: "Reflection found at #{new_uri} with param #{param[0]}")
+
+        payload = "#{SecureRandom.hex(24)}<'\">#{SecureRandom.hex(24)}"
+        new_uri = uri.dup
+        new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, payload] : [k, v] })
+        request = fetch(new_uri)
+        if request.code == "200" && request.body.include?(payload)
+          log(level: :info, message: "XSS found at #{new_uri} with param #{param[0]}")
+          @Intresting << { url: new_uri, param: param[0], payload: payload }
+        end
+      end
+
+      if request.code == "200" && request.body.match(@FileInclusionRegex)
+        log(level: :info, message: "File Inclusion found at #{new_uri} with param #{param[0]}")
+        @Intresting << { url: new_uri, param: param[0], payload: "File Inclusion" }
+      end
+
+      sqli_check(uri, params, param)
+    end
+  end
+
+  def sqli_check(uri, params, param)
+    sqli_chars = ["'", '"', ")", "(", ",", ".", "--", ";'"]
+
+    sqli_chars.each do |char|
+      value = param[1] + char
+      new_uri = uri.dup
+      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, value] : [k, v] })
+      request = fetch(new_uri)
+      page = request.body
+
+      heuristic_page = page
+      format_exception_strings = ["syntax error", "unexpected", "unrecognized"]
+
+      casting = format_exception_strings.any? { |str| page.include?(str) } && !format_exception_strings.any? { |str| heuristic_page.include?(str) }
+
+      if !casting && !request.body.include?("database") && param[1].match?(/^\d+$/)
+        rand_int = SecureRandom.random_number(10)
+        new_value = "#{param[1].to_i + rand_int}-#{rand_int}"
+        value = "#{new_value}#{char}"
+        new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, value] : [k, v] })
+        request = fetch(new_uri)
+        if request.body.include?(new_value)
+          rand_str = SecureRandom.hex(10)
+          new_value = "#{param[1]}.#{SecureRandom.random_number(9) + 1}#{rand_str}"
+          value = "#{new_value}#{char}"
+          new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, value] : [k, v] })
+          request = fetch(new_uri)
+          casting = request.body.include?(new_value)
+        end
+      end
+
+      heuristic_test = if casting
+          :casted
+        elsif !request.body.include?("database")
+          :negative
+        else
+          :positive
+        end
+
+      if heuristic_test == :casted || heuristic_test == :positive
+        log(level: :info, message: "Heuristic SQLi found at #{new_uri} with param #{param[0]} using char #{char}")
+        @Intresting << { url: new_uri, param: param[0], payload: value }
+      end
+    end
+  end
 end
 
 out = {}
@@ -136,11 +213,22 @@ ARGV.each do |arg|
   end
 end
 
+if out.empty?
+  puts("Usage: ruby one.rb --url=https://example.com [--inbound=true]")
+  exit 1
+elsif out["url"].nil?
+  puts("URL is required")
+  exit 1
+elsif out["url"].empty?
+  puts("URL is empty")
+  exit 1
+end
+
 exit 1 if out.empty?
 
 main = Spider.new(url: out["url"])
 
-main.log(level: :info, message: "Starting crawling agains't #{out["url"]}... [gimme a second]")
+main.log(level: :info, message: "Starting crawling against #{out["url"]}... [gimme a second]")
 
 begin
   request = main.fetch(main.targetUrl)
@@ -151,7 +239,6 @@ begin
       main.targetUrl = main.uri(request["location"])
       main.log(level: :info, message: "Redirected to #{main.targetUrl} .. set as new target")
     end
-    # 404 page
   elsif request.code == "404"
     main.log(level: :error, message: "404 page not found for #{main.targetUrl}")
     exit 1
@@ -167,10 +254,11 @@ main.Urls << main.targetUrl
 while main.Urls.any?
   url = main.Urls.shift
   next if url.nil? || main.Visited.include?(url)
-  # next if main.IgnoreList.any? { |ext| url.end_with?(ext) }
 
   main.Visited << url
   uri = main.uri(url)
+  next if uri.nil?
+
   begin
     request = main.fetch(uri)
     next if request.nil?
@@ -188,43 +276,11 @@ while main.Urls.any?
     end
   end
 
-  # Check if there's any Parameters.
   if !uri.query.nil?
     params = URI.decode_www_form(uri.query)
-    params.each do |param|
-      # Check for Reflection #
-      # If found then Check for XSS #
-      reflectPayload = SecureRandom.hex(10)
-      new_uri = uri.dup
-      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, reflectPayload] : [k, v] })
-      request = main.fetch(new_uri)
-      if request.code == "200" && request.body.include?(reflectPayload)
-        main.log(level: :info, message: "Reflection found at #{new_uri} with param #{param[0]}")
-        # Check for XSS #
-        payload = "<'\">"
-        new_uri = uri.dup
-        new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, payload] : [k, v] })
-        request = main.fetch(new_uri)
-        if request.code == "200" && request.body.include?(payload)
-          main.log(level: :info, message: "XSS found at #{new_uri} with param #{param[0]}")
-          main.Intresting << { url: new_uri, param: param[0], payload: payload }
-        end
-      end
-
-      # # Send a request with the parameter and XSS Payload
-      # payload = "<'\">"
-      # new_uri = uri.dup
-      # new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, payload] : [k, v] })
-      # request = main.fetch(new_uri)
-      # next unless request.code == "200"
-
-      # body = request.body
-      # next unless body.include?(payload)
-
-      # main.Intresting << { url: new_uri, param: param[0], payload: payload }
-
-    end
+    main.perform_checks(uri, params)
   end
+
   next unless request.code == "200"
   body = request.body
   next unless body.include?("href")
@@ -232,7 +288,6 @@ while main.Urls.any?
   body.scan(/href=["'](.*?)["']/).flatten.each do |link|
     next if link.nil? || link.empty?
 
-    # Should we check for outbound links?
     if out["inbound"] == "false"
       main.Urls << link
       next
