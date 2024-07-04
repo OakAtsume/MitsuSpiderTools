@@ -240,13 +240,10 @@ ARGV.each do |arg|
   end
 end
 
-
-
 # if out["url"].nil? || out["url"].empty?
 #   puts("URL is required")
 #   exit 1
 # end
-
 
 if out.empty?
   puts("Usage: ruby one.rb --url=https://example.com [--inbound=true]")
@@ -279,7 +276,6 @@ else
   # puts("Filling empty parameters with random values .. [#{out["fillempty"]}]")
   out["fillempty"] = out["fillempty"].downcase
 end
-
 
 main.log(level: :info, message: "Starting crawling against #{out["url"]}... [gimme a second]")
 
@@ -353,7 +349,6 @@ while main.Urls.any?
       params.map! { |k, v| v.empty? ? [k, SecureRandom.hex(16)] : [k, v] } # Fill empty parameters with random values
     end
 
-
     main.checksHeuristic(uri, params)
   end
 
@@ -383,27 +378,30 @@ while main.Urls.any?
   #   main.Urls << form
   # end
 
+  begin
+    forms = body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>.*?<\/form>/im)
 
-  forms = body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>.*?<\/form>/im)
-  
-  forms.each do |form|
-    action = form[0]
-    method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
-    # Extract input elements
-    inputs = body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
-    # Update URI based on method
-    form_uri = URI.join(uri, action)
-    if method == "GET"
-      # Adjust the query string based on inputs' names
-      query_hash = URI.decode_www_form(form_uri.query || "") + inputs.map { |i| [i, ""] }
-      form_uri.query = URI.encode_www_form(query_hash)
+    forms.each do |form|
+      action = form[0]
+      method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
+      # Extract input elements
+      inputs = body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
+      # Update URI based on method
+      form_uri = URI.join(uri, action)
+      if method == "GET"
+        # Adjust the query string based on inputs' names
+        query_hash = URI.decode_www_form(form_uri.query || "") + inputs.map { |i| [i, ""] }
+        form_uri.query = URI.encode_www_form(query_hash)
+      end
+      # Add the form to the list of URLs to be tested
+      next if main.Urls.include?(form_uri.to_s)
+      # puts form_uri.to_s
+      main.Urls << form_uri.to_s
     end
-    # Add the form to the list of URLs to be tested
-    next if main.Urls.include?(form_uri.to_s)
-    # puts form_uri.to_s
-    main.Urls << form_uri.to_s
+  rescue => e
+    # Silent Error
+    next
   end
-
 
   # Emails (mailto)
   body.scan(/mailto:(.*?)[\?"]/).flatten.each do |email|
