@@ -1,9 +1,10 @@
-require "net/http"
-require "uri"
-require "securerandom"
+require("net/http")
+require("uri")
+require("cgi")
+require("securerandom")
 
 class Spider
-  def initialize(url: nil, inbound: true)
+  def initialize(cookie: "", threads: 5, inbound: true, logreflection: false)
     @UserAgents = [
       "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
       "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.1",
@@ -11,16 +12,10 @@ class Spider
       "Mozilla/5.0 (BlackBerry; U; BlackBerry 9900; en) AppleWebKit/534.11+ (KHTML, like Gecko) Version/7.1.0.346 Mobile Safari/534.11+",
       "Mozilla/5.0 (BlackBerry; U; BlackBerry 9800; zh-TW) AppleWebKiwt/534.8+ (KHTML, like Gecko) Version/6.0.0.448 Mobile Safari/534.8+",
     ]
-
     @Agent = @UserAgents.sample
-    @Urls = []
-    @Visited = []
-    @Cookies = {}
-    @Intresting = [] # XSS, SQLi, LFI etc
-    @Information = [] # Emails, Phone Numbers etc
-    @target = url
-    @targetUrl = uri(@target)
-    @IgnoreList = %w[
+    @visited = [] # Base URL's of visited pages
+    @vulnerable = [] # Records of Vulnerable pages { url: "http://example.com", type: "SQLi", payload: "1' OR 1=1 --", response: "" }
+    @ignoredexts = %w[
       css
       js
       jpg
@@ -37,20 +32,21 @@ class Spider
       mp4
       mp3
       pdf
+      doc
+      docx
+      xls
+      xlsx
+      ppt
+      pptx
     ]
-    @Payloads = {
-      "LFI" => /(?i)[^\n]{0,100}(no such file|failed (to )?open)[^\n]{0,100}/,
-      "XSS" => "<'\">",
-      "SQLi" => {
-        "Injections" => ["'", '"', ")", "(", ",", ".", "--", ";"],
-        "Exceptions" => ["There's an issue", "unknown error", "syntax error", "unclosed quotation mark", "database error"],
-      },
-      "Email" => /^[^@]+@[^@]+\.[^@]+$/,
+    @threads = []
+    @settings = {
+      inbound: inbound,
+      logreflection: logreflection,
+      cookie: cookie,
+      threads: threads,
+
     }
-
-    # @FileInclusionRegex = /(?i)[^\n]{0,100}(no such file|failed (to )?open)[^\n]{0,100}/
-
-    log(level: :info, message: "No URL provided? (what r u trying to do bro)") if url.nil?
   end
 
   def log(level: :info, message: "", msg: "", code: nil)
@@ -62,6 +58,12 @@ class Spider
       puts("\e[31m[ERROR]\e[0m [#{timestamp}] #{message}")
     when :httplog
       puts("\e[34m[HTTP]\e[0m [#{timestamp}] #{message} (#{color(code)})")
+    when :heuristicXSS
+      puts("\e[31m[HEURISTIC-XSS]\e[0m [#{timestamp}] #{message}")
+    when :heuristicSQLi
+      puts("\e[31m[HEURISTIC-SQLi]\e[0m [#{timestamp}] #{message}")
+    when :heuristicLFI
+      puts("\e[31m[HEURISTIC-LFI]\e[0m [#{timestamp}] #{message}")
     else
       puts("\e[34m[DEBUG]\e[0m [#{timestamp}] #{message}")
     end
@@ -86,378 +88,344 @@ class Spider
     end
   end
 
-  def uri(path)
+  def uri(path, base = nil) # Path = The URL to parse | Base = The base URL to use (incalculates relative URL's)
     begin
-      path = path.to_s if path.is_a?(URI)
+      # path = path.to_s if path.is_a?(URI)
+
+      # raise if !base.is_a?(URI) && !base.nil? # If not a URI or nil, raise an error
       if path =~ /^http/
         URI.parse(path)
       elsif path =~ /^\/\//
-        URI.join(@target, path)
+        URI.join(base, path)
       elsif path.include?("#")
-        # Not an actual URL
-        URI.parse(path.split("#").first)
+        URI.parse(path.split("#")[0])
       else
-        URI.join(@target, path)
+        begin
+          URI.join(base, path)
+        rescue => e
+          # puts("Error: #{e} - #{path} \n #{e.backtrace}")
+          nil
+        end
+
+        # URI.join(base, path)
+
       end
-    rescue URI::InvalidURIError
+    rescue => e
+      # log(level: :error, message: "Error parsing URL: #{path}\n#{e}\n#{e.backtrace}")
       nil
     end
   end
 
-  def normalizeURL(url)
-    uri = uri(url)
-    return nil if uri.nil?
-    uri.query = nil
+  def normalize(uri)
+    nil if uri.nil?
+    uri = uri.dup
     uri.fragment = nil
-    uri.to_s
+    uri.query = nil
+    uri
   end
 
-  def fetch(uri, headers: {}, parameters: {})
+  # Stuff for the bot #
+  def fetch(uri, headers: {}, parameters: {}, agent: @Agent)
     request = Net::HTTP::Get.new(uri)
-    request["User-Agent"] = @Agent
-    if @Cookies.any?
-      request["Cookie"] = @Cookies.map { |k, v| "#{k}=#{v}" }.join("; ")
-    end
-    headers.each { |k, v| request[k] = v }
-    request.set_form_data(parameters) if parameters.any?
+    # Set timeout to 2 seconds
 
-    host = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https",
-                                                   verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+    request["User-Agent"] = agent
+    request["Cookie"] = @settings[:cookie]
+    headers.each do |key, value|
+      request[key] = value
+    end
+    request.set_form_data(parameters) if parameters.any?
+    host = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
       http.request(request)
     end
-    host["set-cookie"]&.split("; ")&.each do |cookie|
-      key, value = cookie.split("=")
-      @Cookies[key] = value
-    end
     host
-  rescue StandardError => e
-    log(level: :error, message: "Failed to fetch #{uri} - #{e}")
+  rescue => e
+    # log(level: :error, message: "Error fetching URL: #{uri}\n#{e}\n#{e.backtrace}")
     nil
   end
 
-  def inbound?(target)
-    begin
-      target = uri(target) if target.is_a?(String)
-      return false unless target.is_a?(URI::HTTP) || target.is_a?(URI::HTTPS)
-
-      target.host == @targetUrl.host
-    rescue => e
-      false
-    end
-  end
-
-  attr_accessor :target, :targetUrl, :Urls, :Visited, :Cookies, :Intresting, :IgnoreList, :Information, :ExcludeList
-
-  def checksHeuristic(uri, params)
+  def heuristic(uri, params)
     params.each do |param|
-      reflectionPayload = SecureRandom.hex(16)
-      new_uri = uri.dup
-      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, reflectionPayload] : [k, v] })
-      request = fetch(new_uri)
-      if request.code == "200" && request.body.include?(reflectionPayload)
-        log(level: :info, message: "Reflected Input at Parameter(#{param[0]}) in URL(#{new_uri})")
-
-        payload = "#{SecureRandom.hex(16)}#{@Payloads["XSS"]}#{SecureRandom.hex(16)}"
-        new_uri = uri.dup
-        new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, payload] : [k, v] })
-        request = fetch(new_uri)
-        if request.code == "200" && request.body.include?(payload)
-          log(level: :info, message: "Heuristic Checks found that Parameter(#{param[0]}) from URL(#{new_uri}) might be vulnerable to XSS")
-          @Intresting << { url: new_uri, param: param[0], payload: payload }
-          # @Intresting << { url: new_uri, param: param[0], payload: payload }
+      # Check : Reflection
+      reflectPay = SecureRandom.hex(8)
+      newUri = uri.dup
+      newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, reflectPay] : [k, v] })
+      # newUri.query = URI.encode_uri_component(params.map { |k, v| k == param[0] ? [k, reflectPay] : [k, v] }.to_h)
+      req = fetch(newUri)
+      if req.body.include?(reflectPay)
+        log(level: :heuristicXSS, message: "Reflection found in: #{uri} (#{param[0]})") if @settings[:logreflection]
+        xssPay = "#{SecureRandom.hex(8)}<'\">#{SecureRandom.hex(8)}"
+        newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, xssPay] : [k, v] })
+        # newUri.query = URI.encode_uri_component(params.map { |k, v| k == param[0] ? [k, xssPay] : [k, v] }.to_h)
+        req = fetch(newUri)
+        if req.body.include?(xssPay)
+          log(level: :heuristicXSS, message: "XSS found in: #{uri} (#{param[0]})")
+          @vulnerable << { url: uri, type: "XSS", payload: xssPay, response: "Reflection Of Payload Vector (<'\">)", param: param[0] }
         end
       end
+      # Check LFI
+      if req.body.match?(/(?i)[^\n]{0,100}(no such file|failed (to )?open)[^\n]{0,100}/)
+        log(level: :heuristicLFI, message: "LFI found in: #{uri} (#{param[0]}) - Reflection Of Payload Vector (no such file)")
+        @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (no such file)", param: param[0] }
+      elsif uri.path.include?("../")
+        log(level: :heuristicLFI, message: "LFI found in: #{uri} (#{param[0]}) - Reflection Of Payload Vector (../)")
 
-      if request.code == "200" && request.body.match(@Payloads["LFI"])
-        log(level: :info, message: "Heuristic Checks found that Parameter(#{param[0]}) from URL(#{new_uri}) might be vulnerable to LFI")
-        @Intresting << { url: new_uri, param: param[0], payload: "File Inclusion" }
-        # log(level: :info, message: "File Inclusion found at #{new_uri} with param #{param[0]}")
-        # @Intresting << { url: new_uri, param: param[0], payload: "File Inclusion" }
-      end
-
-      sqliCheck(uri, params, param)
-    end
-  end
-
-  def sqliCheck(uri, params, param)
-    # sqli_chars = ["'", '"', ")", "(", ",", ".", "--", ";"]
-    # format_exception_strings = ["There's an issue", "unknown error", "syntax error", "unclosed quotation mark", "database error"]
-
-    @Payloads["SQLi"]["Injections"].each do |char|
-      value = param[1] + char
-      new_uri = uri.dup
-      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, value] : [k, v] })
-      request = fetch(new_uri)
-      page = request.body
-
-      if @Payloads["SQLi"]["Exceptions"].any? { |str| page.include?(str) } || (param[1].match?(/^\d+$/) && blindSQLiDetect?(new_uri, params, param, char))
-        log(level: :info, message: "Heuristic Checks found that Parameter(#{param[0]}) from URL(#{new_uri}) might be vulnerable to SQL-Injection : #{char}")
-        @Intresting << { url: new_uri, param: param[0], payload: char }
-        break # Break the loop if found
+        @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (../)", param: param[0] }
+        
       end
     end
-  end
-
-  def blindSQLiDetect?(uri, params, param, char)
-    rand_int = SecureRandom.random_number(10)
-    new_value = "#{param[1].to_i + rand_int}-#{rand_int}"
-    new_uri = uri.dup
-    new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, "#{new_value}#{char}"] : [k, v] })
-    request = fetch(new_uri)
-    page = request.body
-
-    if page.include?(new_value)
-      rand_str = SecureRandom.hex(10)
-      new_value = "#{param[1]}.#{SecureRandom.random_number(9) + 1}#{rand_str}"
-      new_uri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, "#{new_value}#{char}"] : [k, v] })
-      request = fetch(new_uri)
-      return request.body.include?(new_value)
-    end
-    false
-  end
-
-  def isValidPhoneNumber?(phone)
-    phone.match?(/^\d{10,14}$/)
-  end
-
-  def isValidEmail?(email)
-    email.match?(@Payloads["Email"])
-    #  email.match?(/(?:(?:[a-z0-9!#$%&'*+\/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+\/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])/)
-  end
-end
-
-out = {}
-valid = %w[url inbound exclude fillempty]
-ARGV.each do |arg|
-  next unless arg.start_with?("--") || arg.start_with?("-")
-
-  key, value = arg.split("=")
-  key = key[2..]
-  out[key] = value
-  unless valid.include?(key)
-    puts("> Not sure what to do with `\e[1m#{key}\e[0m` - ignoring")
-    out.delete(key)
-  end
-end
-
-# if out["url"].nil? || out["url"].empty?
-#   puts("URL is required")
-#   exit 1
-# end
-
-if out.empty?
-  puts("Usage: ruby one.rb --url=https://example.com [--inbound=true]")
-  exit 1
-elsif out["url"].nil?
-  puts("URL is required")
-  exit 1
-elsif out["url"].empty?
-  puts("URL is empty")
-  exit 1
-end
-
-exit 1 if out.empty?
-
-main = Spider.new(url: out["url"])
-
-if out["exclude"].nil? # Exclude list
-  out["exclude"] = ""
-else
-  main.log(level: :info, message: "Excluding file types .. [#{out["exclude"]}]")
-  out["exclude"] = out["exclude"].downcase
-  # Add new file types to the list
-  main.IgnoreList = main.IgnoreList + out["exclude"].split(",")
-end
-
-if out["fillempty"].nil? # Fill empty parameters with random values
-  out["fillempty"] = "false"
-else
-  main.log(level: :info, message: "Filling empty parameters with random values .. [#{out["fillempty"]}]")
-  # puts("Filling empty parameters with random values .. [#{out["fillempty"]}]")
-  out["fillempty"] = out["fillempty"].downcase
-end
-
-main.log(level: :info, message: "Starting crawling against #{out["url"]}... [gimme a second]")
-
-begin
-  request = main.fetch(main.targetUrl)
-  if request.is_a?(Net::HTTPRedirection) || request.is_a?(Net::HTTPMovedPermanently) || request.is_a?(Net::HTTPFound)
-    if request["location"].nil?
-      main.log(level: :error, message: "Redirected to an empty location? (#{request.code})")
-    else
-      main.targetUrl = main.uri(request["location"])
-      main.log(level: :info, message: "Redirected to #{main.targetUrl} .. set as new target")
-    end
-  elsif request.code == "404"
-    main.log(level: :error, message: "404 page not found for #{main.targetUrl}")
-    exit 1
-  else
-    main.log(level: :httplog, message: "Fetched #{main.targetUrl}", code: request.code)
-  end
-rescue StandardError => e
-  main.log(level: :error, message: "Failed to fetch #{main.targetUrl} - #{e}")
-end
-
-main.Urls << main.targetUrl
-
-while main.Urls.any?
-  url = main.Urls.shift
-  next if url.nil?
-  begin
-    normalized_url = main.normalizeURL(url)
-    normal = main.uri(normalized_url)
-    if File.extname(normal.path)
-      ext = normal.path.split(".")
-      if main.IgnoreList.include?(ext[-1])
-        next
-      end
-    end
-
-    next if main.Visited.include?(normalized_url)
   rescue => e
-    # main.log(level: :error, message: "Something went wrong.. skipping..")
-    next # Silent Error
+    log(level: :error, message: "Error in heuristic: #{uri}\n#{e}\n#{e.backtrace}")
   end
-  main.Visited << normalized_url
-  #  next if main.Visited.include?(url)
-  # main.Visited << url
-  uri = main.uri(url)
-  next if uri.nil?
 
-  begin
-    request = main.fetch(uri)
-    next if request.nil?
-
-    if request.is_a?(Net::HTTPRedirection) || request.is_a?(Net::HTTPMovedPermanently) || request.is_a?(Net::HTTPFound)
-      if request["location"].nil?
-        main.log(level: :error, message: "Possibly broken redirect at #{url} (#{request.code})")
-      else
-        new_url = main.uri(request["location"])
-        main.log(level: :httplog, message: "#{url} ~> #{new_url}", code: request.code, msg: request.message)
-        uri = new_url
-      end
-    else
-      main.log(level: :httplog, message: "#{url} - #{request.message}", code: request.code)
+  def extractlinks(uri, body)
+    links = []
+    links = body.scan(/href=["'](.*?)["']/).flatten.each do |link|
+      next if link.nil? || link.empty? || link.start_with?("#")
     end
+    links
   end
 
-  next if uri.nil?
-  unless uri.query.nil?
-    params = URI.decode_www_form(uri.query)
-    # puts "#{uri} => #{params}"
-    if out["fillempty"] == "true"
-      params.map! { |k, v| v.empty? ? [k, SecureRandom.hex(16)] : [k, v] } # Fill empty parameters with random values
-    end
+  # def extractform(uri, body) # Cuz why not? :D
 
-    main.checksHeuristic(uri, params)
-  end
-
-  next unless request.code == "200"
-  body = request.body
-  next unless body.include?("href")
-  # URL's
-  body.scan(/href=["'](.*?)["']/).flatten.each do |link|
-    next if link.nil? || link.empty?
-    if out["inbound"] == "false"
-      main.Urls << link
-      next
-    end
-    next unless main.inbound?(link)
-    main.Urls << link
-  end
-  # # Forms
-  # body.scan(/<form.*?action=["'](.*?)["']/).flatten.each do |form|
-  #   next if form.nil? || form.empty?
-  #   # puts form
-
-  #   if out["inbound"] == "false"
-  #     main.Urls << form
-  #     next
-  #   end
-  #   next unless main.inbound?(form)
-  #   main.Urls << form
   # end
 
-  begin
-    forms = body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>.*?<\/form>/im)
-
-    forms.each do |form|
-      action = form[0]
-      method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
-      # Extract input elements
-      inputs = body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
-      # Update URI based on method
-      form_uri = URI.join(uri, action)
-      if method == "GET"
-        # Adjust the query string based on inputs' names
-        query_hash = URI.decode_www_form(form_uri.query || "") + inputs.map { |i| [i, ""] }
-        form_uri.query = URI.encode_www_form(query_hash)
-      end
-      # Add the form to the list of URLs to be tested
-      next if main.Urls.include?(form_uri.to_s)
-      # puts form_uri.to_s
-      main.Urls << form_uri.to_s
+  def dork(query, page = 0)
+    cookie = "CONSENT=YES+shp.gws-#{Time.new.strftime("%Y%m%d")}-0-RC1.#{SecureRandom.alphanumeric(2).downcase}+FX+740"
+    uri = "https://www.google.com/search?q=#{URI.encode_uri_component(query)}&num=100&hl=en&complete=0&safe=off&filter=0&btnG=Search&start=#{page}"
+    uri = URI.parse(uri)
+    req = fetch(uri, headers: { "Cookie" => cookie }, agent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:49.0) Gecko/20100101 Firefox/49.0")
+    if req.body.include?("Our systems have detected unusual traffic")
+      log(level: :error, message: "Google has detected unusual traffic, please try again later.")
+      exit 1
     end
+    page = req.body
+    page = page.gsub(/\\x([0-9A-Fa-f]{2})/) { |match| $1.hex.chr }
+    page = CGI.unescapeHTML(page)
+    page.gsub!(/<script.*?>.*?<\/script>/m, "")
+    page.gsub!(/<style.*?>.*?<\/style>/m, "")
+    page.gsub!(/&nbsp;/, " ")
+    page.gsub!(/&amp;/, "&")
+    found = page.scan(/href="\/url\?esrc=s&q=&rct=j&sa=U&url=([^&]+)&ved=[^"]+" data-ved="[^"]+"/).flatten
   rescue => e
-    # Silent Error
-    next
+    log(level: :error, message: "Error in dork: #{query}\n#{e}\n#{e.backtrace}")
+    []
   end
 
-  # Emails (mailto)
-  body.scan(/mailto:(.*?)[\?"]/).flatten.each do |email|
-    next if email.nil? || email.empty?
-    # Next if already found
-    next if main.Information.any? { |i| i[:value] == email }
-    if main.isValidEmail?(email)
-      main.Information.push(
-        {
-          type: "email",
-          path: uri,
-          value: email,
-        }
-      )
-      main.log(level: :info, message: "Found email address: #{email}")
+  def bot(id, url)
+    localId = id
+    localUrl = url
+    hit = []
+    pending = []
+    pending.push(localUrl) # Add the first URL to the pending list
+    while pending.any?
+      target = pending.shift
+      target = uri(target, localUrl)
+      next if target.nil?
+      next if hit.include?(normalize(target)) # Skip if already visited
+      begin
+        req = fetch(target)
+        hit.push(normalize(target)) # Add the URL to the hit list (visited) # No need to normalize, we want the full URL here
+        next if req.nil?
+
+        # puts("Target: #{target} : Query: #{target.query}")
+        if target.query
+          # puts("Query: #{target.query}")
+          heuristic(target, URI.decode_www_form(target.query))
+          # Also add the url without the query to the pending list (this can be used to find more links)
+          pending.push(uri(target, target.dup.query = nil))
+        end
+
+        if req.is_a?(Net::HTTPRedirection) || req.is_a?(Net::HTTPMovedPermanently) || req.is_a?(Net::HTTPFound) || req.is_a?(Net::HTTPSeeOther) || req.is_a?(Net::HTTPTemporaryRedirect) || req.is_a?(Net::HTTPPermanentRedirect)
+          if req["Location"].nil?
+            log(level: :httplog, message: "Broken redirection in: #{target} : #{req.code} (#{req.message})")
+            return
+          end
+          pending.push(req["Location"]) # Add the redirection to the pending list
+          log(level: :httplog, message: "#{target} ~> #{req["Location"]} #{req.message} ", code: req.code)
+          next
+        end
+        bodysize = 0
+        if !req.body.nil?
+          bodysize = req.body.length
+
+          begin
+            forms = req.body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>(.*?)<\/form>/m)
+            forms.each do |form|
+              action = form[0]
+              method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
+              # Extract input elements
+              inputs = req.body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
+              # Update URI based on method
+              form_uri = uri(action, target)
+              if method == "GET"
+                # Adjust the query string based on inputs' names
+                query_hash = URI.decode_www_form(form_uri.query || "") + inputs.map { |i| [i, ""] }
+                form_uri.query = URI.encode_www_form(query_hash)
+              end
+              next if form_uri.nil? || form_uri.query.nil?
+              heuristic(form_uri, URI.decode_www_form(form_uri.query))
+            rescue => e
+              log(level: :error, message: "Error in bot: #{e}\n#{e.backtrace}")
+            end
+          end
+
+          found = extractlinks(target, req.body)
+          found.each do |link|
+            next if link.nil? || link.empty? || link.start_with?("#")
+            # Check it's inbounds
+            if @settings[:inbound]
+              begin
+                next unless uri(link, target).host == target.host
+              rescue => e
+                # puts(">> Error: #{e} - #{link} - #{target} \n #{e.backtrace.join("\n")}")
+              end
+            end
+            # puts link
+            pending.push(link)
+          end
+        end
+
+        log(level: :httplog, message: "#{target} - #{req.message} - B(#{bodysize})", code: req.code)
+      rescue => e
+        log(level: :error, message: "Error in bot: #{e}\n#{e.backtrace}")
+      end
     end
   end
-  # Phone Numbers
-  body.scan(/tel:(.*?)[\?"]/).flatten.each do |phone|
-    next if phone.nil? || phone.empty?
-    next if main.Information.any? { |i| i[:value] == phone }
-    if main.isValidPhoneNumber?(phone)
-      main.Information.push(
-        {
-          type: "phone",
-          path: uri,
-          value: phone,
-        }
-      )
-      main.log(level: :info, message: "Found phone number: #{phone}")
-    end
+
+  attr_reader :vulnerable, :visited, :settings, :ignoredexts, :UserAgents, :Agent
+end
+
+# def initialize(cookie: "", threads: 5, inbound: true, logreflection: false)
+options = {
+  "cookie" => "",
+  "threads" => 5, # How many threads to use per target
+  "inbound" => true,
+  "logreflection" => false,
+  "dork" => nil,
+  "page" => 0,
+  "url" => nil,
+}
+
+spider = Spider.new(cookie: options["cookie"], threads: options["threads"].to_i, inbound: options["inbound"], logreflection: options["logreflection"])
+
+# spider.bot(1, "http://crawler-test.com/")
+# spider.bot(2, "https://rawr.homes/waf?q=hi")
+
+ARGV.each do |arg|
+  next unless arg.start_with?("--") || arg.start_with?("-")
+  k, v = arg.split("=", 2)
+  k = k[2..]
+  # puts options
+  unless options.key?(k)
+    puts options
+
+    puts("Invalid option: #{k}")
+    exit 1
+  end
+  options[k] = v
+end
+ARGV.clear
+
+if options["dork"].nil? && options["url"].nil?
+  puts("Usage: #{__FILE__} --dork=<query>|--url=<url> [--cookie=<cookie>] [--threads=<threads>] [--inbound=<true/false>] [--logreflection=<true/false>] [--page=<page>]")
+  puts("[--dork] - Google dork to search for : Especify page with --page=<page>")
+  puts("[--url] - URL to scan")
+  puts("[--cookie] - Cookie to use in requests")
+  puts("[--threads] - Number of threads to use")
+  puts("[--inbound] - Remain in the same domain")
+  puts("[--logreflection] - Log reflection payloads")
+  puts("[--page] - Page to start dorking")
+  exit 1
+end
+
+spider = Spider.new(cookie: options["cookie"], threads: options["threads"].to_i, inbound: options["inbound"], logreflection: options["logreflection"])
+targets = []
+explored = []
+threads = []
+
+if options["dork"]
+  spider.log(level: :info, message: "Using search results page ##{options["page"]}")
+  results = spider.dork(options["dork"], options["page"].to_i + 1)
+  if results.empty?
+    spider.log(level: :error, message: "No results found for your search dork expression.")
+    exit 1
+  end
+  # spider.log("found #{results.size} results for your search dork expression.")
+  spider.log(level: :info, message: "Found #{results.size} results for your search dork expression.")
+  targets.concat(results) # Add results to targets
+elsif options["url"]
+  targets << options["url"] # Add URL to targets
+else
+  spider.log(level: :error, message: "No target specified.")
+  exit 1
+end
+
+targets.each_with_index do |target, index|
+  next if target.nil? || target.empty?
+  threads << Thread.new do
+    spider.bot(index, target)
   end
 end
-# Draw a Line #
-main.log(level: :info, message: "-" * 50)
-main.log(level: :info, message: "Crawling completed..")
-main.log(level: :info, message: "Intresting URLs: #{main.Intresting.count}")
-main.log(level: :info, message: "Information found: #{main.Information.count}")
-main.log(level: :info, message: "Visited URLs: #{main.Visited.count}")
-main.log(level: :info, message: "Total URLs: #{main.Urls.count}")
-main.log(level: :info, message: "Total Cookies: #{main.Cookies.count}")
 
-main.log(level: :info, message: "-" * 50)
+trap "SIGINT" do
+  spider.log(level: :info, message: "Exiting...")
+  # Before existing, log all the vulnerable pages
+  spider.vulnerable.each do |vuln|
+    spider.log(level: :error, message: "Vulnerable page: #{vuln[:url]} (#{vuln[:type]}) - #{vuln[:response]} - #{vuln[:param]}")
+  end
 
-main.Intresting.each do |i|
-  main.log(level: :info, message: "Intresting URL: #{i[:url]}")
-  main.log(level: :info, message: "Parameter: #{i[:param]}")
-  main.log(level: :info, message: "Payload: #{i[:payload]}")
+  threads.each(&:exit)
+  exit 0
 end
 
-main.log(level: :info, message: "-" * 50)
+threads.each(&:join)
 
-main.Information.each do |i|
-  main.log(level: :info, message: "Information Type: #{i[:type]}")
-  main.log(level: :info, message: "Path: #{i[:path]}")
-  main.log(level: :info, message: "Value: #{i[:value]}")
-end
+# while targets.any?
+#   # Depending how many threads are active, we can add more targets.
+#   if threads.size < spider.settings[:threads]
+#     target = targets.shift
+#     next if explored.include?(target) # Skip if already explored
+#     explored << target
+#     uri = spider.uri(target)
+#     next if uri.nil? # Skip invalid URL's
+#     threads << Thread.new do
+#       begin
+#         req = spider.fetch(uri)
+#         next if req.nil?
+#         spider.heuristic(uri, URI.decode_www_form(uri.query)) if spider.settings[:inbound]
+#         spider.extractform(uri, req.body).each do |form|
+#           next if form.nil?
+#           spider.heuristic(form, URI.decode_www_form(form.query)) if spider.settings[:inbound]
+#         end
+#         spider.extractlinks(uri, req.body).each do |link|
+#           next if link.nil?
+#           targets << link
+#         end
+#       rescue => e
+#         spider.log(level: :error, message: "Error in thread: #{e}\n#{e.backtrace}")
+#       end
+#     end
+#   end
+# end
 
-exit 0
+# # while targets.any?
+# #   target = targets.shift
+# #   puts target
+# #   uri = spider.uri(target)
+# #   next if uri.nil? # Skip invalid URL's
+
+# #   begin
+# #     req = spider.fetch(uri)
+# #     next if req.nil?
+# #     # puts spider.extractlinks(uri, req.body)
+
+# #     if spider.settings[:inbound]
+
+# #     # spider.log(level: :httplog, message: "#{normalised} -> #{spider.color(req.code)}")
+# #     # spider.heuristic(normalised, URI.decode_www_form(normalised.query)) if normalised.query
+
+# #   end
+# # end
+
+# usage: ruby one.rb --dork="inurl:php?id=" --page=0 --threads=5 --inbound=true --logreflection=false
