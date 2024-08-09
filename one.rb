@@ -41,7 +41,7 @@ class Spider
     ]
     @threads = []
     @settings = {
-      inbound: inbound,
+      inbound: inbound.nil? ? true : inbound.to_s.downcase == "true" ? true : false, 
       logreflection: logreflection,
       cookie: cookie,
       threads: threads,
@@ -64,6 +64,8 @@ class Spider
       puts("\e[31m[HEURISTIC-SQLi]\e[0m [#{timestamp}] #{message}")
     when :heuristicLFI
       puts("\e[31m[HEURISTIC-LFI]\e[0m [#{timestamp}] #{message}")
+    when :warning
+      puts("\e[33m[WARNING]\e[0m [#{timestamp}] #{message}")
     else
       puts("\e[34m[DEBUG]\e[0m [#{timestamp}] #{message}")
     end
@@ -171,7 +173,6 @@ class Spider
         log(level: :heuristicLFI, message: "LFI found in: #{uri} (#{param[0]}) - Reflection Of Payload Vector (../)")
 
         @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (../)", param: param[0] }
-        
       end
     end
   rescue => e
@@ -195,6 +196,10 @@ class Spider
     uri = "https://www.google.com/search?q=#{URI.encode_uri_component(query)}&num=100&hl=en&complete=0&safe=off&filter=0&btnG=Search&start=#{page}"
     uri = URI.parse(uri)
     req = fetch(uri, headers: { "Cookie" => cookie }, agent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:49.0) Gecko/20100101 Firefox/49.0")
+    if req.nil? || req.body.nil?
+      log(level: :error, message: "Error in dork: #{query}")
+      return []
+    end
     if req.body.include?("Our systems have detected unusual traffic")
       log(level: :error, message: "Google has detected unusual traffic, please try again later.")
       exit 1
@@ -212,85 +217,112 @@ class Spider
     []
   end
 
-  def bot(id, url)
-    localId = id
-    localUrl = url
-    hit = []
-    pending = []
-    pending.push(localUrl) # Add the first URL to the pending list
-    while pending.any?
-      target = pending.shift
-      target = uri(target, localUrl)
-      next if target.nil?
-      next if hit.include?(normalize(target)) # Skip if already visited
-      begin
-        req = fetch(target)
-        hit.push(normalize(target)) # Add the URL to the hit list (visited) # No need to normalize, we want the full URL here
-        next if req.nil?
+  def inscope?(uri, scope)
+    begin
+      if uri.nil? || scope.nil?
+        return false
+      end
+      if uri.path.nil? || uri.path.empty?
+        return false
+      end
 
-        # puts("Target: #{target} : Query: #{target.query}")
-        if target.query
-          # puts("Query: #{target.query}")
-          heuristic(target, URI.decode_www_form(target.query))
-          # Also add the url without the query to the pending list (this can be used to find more links)
-          pending.push(uri(target, target.dup.query = nil))
+      # if !uri.path.start_with?("http") && !uri.path.start_with?("/")
+      #   return false
+      # end
+
+      # Make sure it starts with http/https or is a relative URL
+      
+      if uri.is_a?(String)
+        uri = URI.parse(uri)
+      end
+      if scope.is_a?(String)
+        scope = URI.parse(scope)
+      end
+      # puts uri
+
+      return true if uri.host == scope.host
+      return true if uri.host.nil? && uri.path.start_with?("/")
+      return true if uri.host.nil? && uri.path.start_with?("../")
+      return true if uri.host.nil? && uri.path.start_with?("./")
+    rescue => e
+      # log(level: :error, message: "Error in inscope: #{uri} - #{scope}\n#{e}\n#{e.backtrace}")
+      # puts("Go scream at Oak to fix this.")
+    end
+    false
+  end
+
+  def bot(id, url)
+    id = id.to_i
+    startTimestamp = Time.now
+    pending = [url]
+    visited = []
+    scope = uri(url) # Scope of the URL (Main-Target)
+    while pending.any?
+      current = uri(pending.shift, scope) # Current URL to visit
+      next if current.nil? || visited.include?(current.to_s)
+      # puts(@settings[:inbound])
+      # puts(@settings[:inbound].class)
+
+      next if @settings[:inbound] && !inscope?(current, scope)
+      visited.push(current.to_s) # Add the URL to the visited list
+      begin
+        stamp = Time.now # Timestamp for the current request
+        req = fetch(current) # Fetch the current URL
+        stamp = Time.now - stamp # Calculate the time taken for the request (in seconds)
+
+        next if req.nil?
+        if req.body.nil?
+          log(level: :warning, message: "#{current} returned an empty body. (#{req.code}) - #{stamp} seconds")
+          next
+        elsif !current.query.nil?
+          begin
+            heuristic(current, URI.decode_www_form(current.query))
+          rescue
+            log(level: :error, message: "Unable to check heuristic for #{current} - #{current.query} : #{stamp} seconds")
+          end
         end
 
         if req.is_a?(Net::HTTPRedirection) || req.is_a?(Net::HTTPMovedPermanently) || req.is_a?(Net::HTTPFound) || req.is_a?(Net::HTTPSeeOther) || req.is_a?(Net::HTTPTemporaryRedirect) || req.is_a?(Net::HTTPPermanentRedirect)
           if req["Location"].nil?
-            log(level: :httplog, message: "Broken redirection in: #{target} : #{req.code} (#{req.message})")
-            return
+            log(level: :warning, message: "#{current} returned a redirection with no location. (#{req.code}) - #{stamp} seconds")
+            next
           end
-          pending.push(req["Location"]) # Add the redirection to the pending list
-          log(level: :httplog, message: "#{target} ~> #{req["Location"]} #{req.message} ", code: req.code)
+          pending.push(req["Location"])
+          log(level: :httplog, message: "#{current} redirected to #{req["Location"]} - #{stamp} seconds", code: req.code)
           next
         end
-        bodysize = 0
-        if !req.body.nil?
-          bodysize = req.body.length
-
-          begin
-            forms = req.body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>(.*?)<\/form>/m)
-            forms.each do |form|
-              action = form[0]
-              method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
-              # Extract input elements
-              inputs = req.body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
-              # Update URI based on method
-              form_uri = uri(action, target)
-              if method == "GET"
-                # Adjust the query string based on inputs' names
-                query_hash = URI.decode_www_form(form_uri.query || "") + inputs.map { |i| [i, ""] }
-                form_uri.query = URI.encode_www_form(query_hash)
-              end
-              next if form_uri.nil? || form_uri.query.nil?
-              heuristic(form_uri, URI.decode_www_form(form_uri.query))
-            rescue => e
-              log(level: :error, message: "Error in bot: #{e}\n#{e.backtrace}")
-            end
-          end
-
-          found = extractlinks(target, req.body)
-          found.each do |link|
-            next if link.nil? || link.empty? || link.start_with?("#")
-            # Check it's inbounds
-            if @settings[:inbound]
-              begin
-                next unless uri(link, target).host == target.host
-              rescue => e
-                # puts(">> Error: #{e} - #{link} - #{target} \n #{e.backtrace.join("\n")}")
-              end
-            end
-            # puts link
-            pending.push(link)
-          end
+        extracted = extractlinks(current, req.body)
+        extracted.each do |page|
+          next if page.nil? || page.empty?
+          # puts page
+          
+          pending.push(page)
         end
 
-        log(level: :httplog, message: "#{target} - #{req.message} - B(#{bodysize})", code: req.code)
-      rescue => e
-        log(level: :error, message: "Error in bot: #{e}\n#{e.backtrace}")
+        begin
+          forms = req.body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>(.*?)<\/form>/m)
+          forms.each do |form|
+            action = form[0]
+            method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
+            inputs = req.body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
+            if method == "GET"
+              newUri = uri(action, current)
+              hash = URI.decode_www_form(newUri.query || "") + inputs.map { |i| [i, ""] }
+              newUri.query = URI.encode_www_form(hash.to_h)
+              next if newUri.nil? || newUri.query.nil?
+              next if visited.include?(normalize(newUri).to_s)
+              visited.push(normalize(newUri).to_s)
+              heuristic(newUri, URI.decode_www_form(newUri.query))
+            end
+          end
+        rescue => e
+          log(level: :error, message: "Unable to check forms for #{current} : #{stamp} seconds \n#{e}\n#{e.backtrace.join("\n")}")
+        end
+        log(level: :httplog, message: "#{current.to_s} - #{req.msg} f(#{forms.size}) l(#{extracted.size}) - #{stamp} seconds", code: req.code)
       end
     end
+    # On finish
+    log(level: :info, message: "Thread ##{id} finished. Visited #{visited.size} pages in #{Time.now - startTimestamp} seconds.")
   end
 
   attr_reader :vulnerable, :visited, :settings, :ignoredexts, :UserAgents, :Agent
@@ -318,8 +350,6 @@ ARGV.each do |arg|
   k = k[2..]
   # puts options
   unless options.key?(k)
-    puts options
-
     puts("Invalid option: #{k}")
     exit 1
   end
@@ -364,6 +394,7 @@ end
 targets.each_with_index do |target, index|
   next if target.nil? || target.empty?
   threads << Thread.new do
+    spider.log(level: :info, message: "Starting thread ##{index} for #{target}")
     spider.bot(index, target)
   end
 end
@@ -372,7 +403,7 @@ trap "SIGINT" do
   spider.log(level: :info, message: "Exiting...")
   # Before existing, log all the vulnerable pages
   spider.vulnerable.each do |vuln|
-    spider.log(level: :error, message: "Vulnerable page: #{vuln[:url]} (#{vuln[:type]}) - #{vuln[:response]} - #{vuln[:param]}")
+    spider.log(level: :info, message: "Vulnerable page: #{vuln[:url]} (#{vuln[:type]}) - #{vuln[:response]} - #{vuln[:param]}")
   end
 
   threads.each(&:exit)
@@ -380,52 +411,3 @@ trap "SIGINT" do
 end
 
 threads.each(&:join)
-
-# while targets.any?
-#   # Depending how many threads are active, we can add more targets.
-#   if threads.size < spider.settings[:threads]
-#     target = targets.shift
-#     next if explored.include?(target) # Skip if already explored
-#     explored << target
-#     uri = spider.uri(target)
-#     next if uri.nil? # Skip invalid URL's
-#     threads << Thread.new do
-#       begin
-#         req = spider.fetch(uri)
-#         next if req.nil?
-#         spider.heuristic(uri, URI.decode_www_form(uri.query)) if spider.settings[:inbound]
-#         spider.extractform(uri, req.body).each do |form|
-#           next if form.nil?
-#           spider.heuristic(form, URI.decode_www_form(form.query)) if spider.settings[:inbound]
-#         end
-#         spider.extractlinks(uri, req.body).each do |link|
-#           next if link.nil?
-#           targets << link
-#         end
-#       rescue => e
-#         spider.log(level: :error, message: "Error in thread: #{e}\n#{e.backtrace}")
-#       end
-#     end
-#   end
-# end
-
-# # while targets.any?
-# #   target = targets.shift
-# #   puts target
-# #   uri = spider.uri(target)
-# #   next if uri.nil? # Skip invalid URL's
-
-# #   begin
-# #     req = spider.fetch(uri)
-# #     next if req.nil?
-# #     # puts spider.extractlinks(uri, req.body)
-
-# #     if spider.settings[:inbound]
-
-# #     # spider.log(level: :httplog, message: "#{normalised} -> #{spider.color(req.code)}")
-# #     # spider.heuristic(normalised, URI.decode_www_form(normalised.query)) if normalised.query
-
-# #   end
-# # end
-
-# usage: ruby one.rb --dork="inurl:php?id=" --page=0 --threads=5 --inbound=true --logreflection=false
