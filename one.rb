@@ -41,7 +41,7 @@ class Spider
     ]
     @threads = []
     @settings = {
-      inbound: inbound.nil? ? true : inbound.to_s.downcase == "true" ? true : false, 
+      inbound: inbound.nil? ? true : inbound.to_s.downcase == "true" ? true : false,
       logreflection: logreflection,
       cookie: cookie,
       threads: threads,
@@ -75,7 +75,7 @@ class Spider
     case code
     when "200"
       "\e[32m#{code}\e[0m"
-    when "301" || "302" || "303" || "307" || "308"
+    when "301" || "302" || "303" || "307" || "308" || "307"
       "\e[34m#{code}\e[0m"
     when "404"
       "\e[33m#{code}\e[0m"
@@ -174,6 +174,26 @@ class Spider
 
         @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (../)", param: param[0] }
       end
+      # # Check for Dynamic Pages
+      # dynamicPay = SecureRandom.hex(8)
+      # newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, dynamicPay] : [k, v] })
+      # dynamicReq = fetch(newUri)
+      # if dynamicReq.body != req.body
+      #   log(level: :heuristicDynamic, message: "Dynamic content detected in: #{uri} (#{param[0]})")
+      #   @vulnerable << { url: uri, type: "Dynamic Content", payload: dynamicPay, response: "Content changes with payload", param: param[0] }
+      # end
+
+      # # Check for Passive SQLi
+      # sqliPayloads = ["'", "\""]
+      # sqliPayloads.each do |sqliPay|
+      #   newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, sqliPay] : [k, v] })
+      #   sqliReq = fetch(newUri)
+      #   if sqliReq.body.match?(/(SQL syntax|Warning: mysql_|Unclosed quotation mark|quoted string not properly terminated|SQL error)/i)
+      #     log(level: :heuristicSQLi, message: "SQLi found in: #{uri} (#{param[0]})")
+      #     @vulnerable << { url: uri, type: "SQLi", payload: sqliPay, response: "SQL error message detected", param: param[0] }
+      #   end
+      # end
+
     end
   rescue => e
     log(level: :error, message: "Error in heuristic: #{uri}\n#{e}\n#{e.backtrace}")
@@ -231,7 +251,7 @@ class Spider
       # end
 
       # Make sure it starts with http/https or is a relative URL
-      
+
       if uri.is_a?(String)
         uri = URI.parse(uri)
       end
@@ -256,11 +276,21 @@ class Spider
     startTimestamp = Time.now
     pending = [url]
     visited = []
+    tested = [] # Base URL's of pages already tested (avoid re-testing)
     scope = uri(url) # Scope of the URL (Main-Target)
     while pending.any?
       current = uri(pending.shift, scope) # Current URL to visit
-      next if current.nil? || visited.include?(current.to_s)
-      # puts(@settings[:inbound])
+      # next if current.nil? || visited.include?(current.to_s)
+
+      # # next if current.nil? || visited.include?(current.to_s) || @ignoredexts.include?(current.path.split(".").last) || visited.include?(normalize(current).to_s)
+      next if current.nil?
+      next if visited.include?(current.to_s) || visited.include?(normalize(current).to_s)
+      if !current.to_s.split(".").last.nil?
+        next if @ignoredexts.include?(current.to_s.split(".").last)
+      end
+      
+
+      # puts(@settings[:inbound]
       # puts(@settings[:inbound].class)
 
       next if @settings[:inbound] && !inscope?(current, scope)
@@ -276,7 +306,10 @@ class Spider
           next
         elsif !current.query.nil?
           begin
+            next if tested.include?(normalize(current).to_s)
+
             heuristic(current, URI.decode_www_form(current.query))
+            tested.push(normalize(current).to_s)
           rescue
             log(level: :error, message: "Unable to check heuristic for #{current} - #{current.query} : #{stamp} seconds")
           end
@@ -288,14 +321,14 @@ class Spider
             next
           end
           pending.push(req["Location"])
-          log(level: :httplog, message: "#{current} redirected to #{req["Location"]} - #{stamp} seconds", code: req.code)
+          log(level: :httplog, message: "#{current} redirected to #{req["Location"]} [#{req.msg}] - #{stamp} seconds ", code: req.code)
           next
         end
         extracted = extractlinks(current, req.body)
         extracted.each do |page|
           next if page.nil? || page.empty?
           # puts page
-          
+
           pending.push(page)
         end
 
@@ -307,12 +340,15 @@ class Spider
             inputs = req.body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
             if method == "GET"
               newUri = uri(action, current)
+              next if newUri.nil? 
               hash = URI.decode_www_form(newUri.query || "") + inputs.map { |i| [i, ""] }
               newUri.query = URI.encode_www_form(hash.to_h)
               next if newUri.nil? || newUri.query.nil?
               next if visited.include?(normalize(newUri).to_s)
               visited.push(normalize(newUri).to_s)
+              next if tested.include?(normalize(current).to_s)
               heuristic(newUri, URI.decode_www_form(newUri.query))
+              tested.push(normalize(newUri).to_s)
             end
           end
         rescue => e
