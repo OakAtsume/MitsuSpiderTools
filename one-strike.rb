@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require('securerandom')
 require('net/http')
 require('uri')
@@ -459,7 +461,7 @@ class SnowBlood
 
       # [Time] [HTTP] [ url ] - [Msg] f(x) l(x) - <time> seconds : (code)
       log(level: :httplog, message: "#{page} f(#{pages.length}) l(#{visited.length})", code: req.code,
-          msg: "#{req.msg}")
+          msg: req.msg.to_s)
       # log(level: :httplog, message: page, msg: "f(#{pages.length}) l(#{visited.length})", code: req.code)
     end
     # All pages have been visited
@@ -596,7 +598,7 @@ ARGV.each do |arg|
   next unless arg.start_with?('--', '-')
 
   k, v = arg.split('=', 2)
-  k = k[2..-1]
+  k = k[2..]
 
   if k == 'help'
     # mitsu.log(level: :info, message: "Help Menu")
@@ -664,9 +666,7 @@ bots = []
 # On Control-C or Exit / kill
 Signal.trap('INT') do
   puts("\nExiting...")
-  bots.each do |bot|
-    bot.kill
-  end
+  bots.each(&:kill)
   # Log all vulns
   mitsu.vulns.each do |vuln|
     puts("#{vuln[:url]} : #{vuln[:type]} : #{vuln[:param]} : #{vuln[:response]}")
@@ -677,9 +677,7 @@ end
 # ON Control-C
 Signal.trap('TERM') do
   puts("\nExiting...")
-  bots.each do |bot|
-    bot.kill
-  end
+  bots.each(&:kill)
   # Log all vulns
   mitsu.vulns.each do |vuln|
     puts("#{vuln[:url]} : #{vuln[:type]} : #{vuln[:param]} : #{vuln[:response]}")
@@ -692,9 +690,7 @@ end
 newset.each do |target|
   if bots.length >= settings['threads']
     # Wait for a bot to finish
-    bots.each do |bot|
-      bot.join
-    end
+    bots.each(&:join)
 
     bots = []
   end
