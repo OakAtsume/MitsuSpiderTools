@@ -10,7 +10,7 @@ class Spider
       "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.1",
       "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.0; Trident/5.0; TheWorld)",
       "Mozilla/5.0 (BlackBerry; U; BlackBerry 9900; en) AppleWebKit/534.11+ (KHTML, like Gecko) Version/7.1.0.346 Mobile Safari/534.11+",
-      "Mozilla/5.0 (BlackBerry; U; BlackBerry 9800; zh-TW) AppleWebKiwt/534.8+ (KHTML, like Gecko) Version/6.0.0.448 Mobile Safari/534.8+",
+      "Mozilla/5.0 (BlackBerry; U; BlackBerry 9800; zh-TW) AppleWebKiwt/534.8+ (KHTML, like Gecko) Version/6.0.0.448 Mobile Safari/534.8+"
     ]
     @Agent = @UserAgents.sample
     @visited = [] # Base URL's of visited pages
@@ -41,10 +41,14 @@ class Spider
     ]
     @threads = []
     @settings = {
-      inbound: inbound.nil? ? true : inbound.to_s.downcase == "true" ? true : false,
+      inbound: if inbound.nil?
+                 true
+               else
+                 inbound.to_s.downcase == "true"
+               end,
       logreflection: logreflection,
       cookie: cookie,
-      threads: threads,
+      threads: threads
 
     }
   end
@@ -91,31 +95,29 @@ class Spider
   end
 
   def uri(path, base = nil) # Path = The URL to parse | Base = The base URL to use (incalculates relative URL's)
-    begin
-      # path = path.to_s if path.is_a?(URI)
+    # path = path.to_s if path.is_a?(URI)
 
-      # raise if !base.is_a?(URI) && !base.nil? # If not a URI or nil, raise an error
-      if path =~ /^http/
-        URI.parse(path)
-      elsif path =~ /^\/\//
+    # raise if !base.is_a?(URI) && !base.nil? # If not a URI or nil, raise an error
+    if /^http/.match?(path)
+      URI.parse(path)
+    elsif /^\/\//.match?(path)
+      URI.join(base, path)
+    elsif path.include?("#")
+      URI.parse(path.split("#")[0])
+    else
+      begin
         URI.join(base, path)
-      elsif path.include?("#")
-        URI.parse(path.split("#")[0])
-      else
-        begin
-          URI.join(base, path)
-        rescue => e
-          # puts("Error: #{e} - #{path} \n #{e.backtrace}")
-          nil
-        end
-
-        # URI.join(base, path)
-
+      rescue
+        # puts("Error: #{e} - #{path} \n #{e.backtrace}")
+        nil
       end
-    rescue => e
-      # log(level: :error, message: "Error parsing URL: #{path}\n#{e}\n#{e.backtrace}")
-      nil
+
+      # URI.join(base, path)
+
     end
+  rescue
+    # log(level: :error, message: "Error parsing URL: #{path}\n#{e}\n#{e.backtrace}")
+    nil
   end
 
   def normalize(uri)
@@ -137,11 +139,10 @@ class Spider
       request[key] = value
     end
     request.set_form_data(parameters) if parameters.any?
-    host = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+    Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
       http.request(request)
     end
-    host
-  rescue => e
+  rescue
     # log(level: :error, message: "Error fetching URL: #{uri}\n#{e}\n#{e.backtrace}")
     nil
   end
@@ -151,27 +152,27 @@ class Spider
       # Check : Reflection
       reflectPay = SecureRandom.hex(8)
       newUri = uri.dup
-      newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, reflectPay] : [k, v] })
+      newUri.query = URI.encode_www_form(params.map { |k, v| (k == param[0]) ? [k, reflectPay] : [k, v] })
       # newUri.query = URI.encode_uri_component(params.map { |k, v| k == param[0] ? [k, reflectPay] : [k, v] }.to_h)
       req = fetch(newUri)
       if req.body.include?(reflectPay)
         log(level: :heuristicXSS, message: "Reflection found in: #{uri} (#{param[0]})") if @settings[:logreflection]
         xssPay = "#{SecureRandom.hex(8)}<'\">#{SecureRandom.hex(8)}"
-        newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, xssPay] : [k, v] })
+        newUri.query = URI.encode_www_form(params.map { |k, v| (k == param[0]) ? [k, xssPay] : [k, v] })
         # newUri.query = URI.encode_uri_component(params.map { |k, v| k == param[0] ? [k, xssPay] : [k, v] }.to_h)
         req = fetch(newUri)
         if req.body.include?(xssPay)
           log(level: :heuristicXSS, message: "XSS found in: #{uri} (#{param[0]})")
-          @vulnerable << { url: uri, type: "XSS", payload: xssPay, response: "Reflection Of Payload Vector (<'\">)", param: param[0] }
+          @vulnerable << {url: uri, type: "XSS", payload: xssPay, response: "Reflection Of Payload Vector (<'\">)", param: param[0]}
         end
       end
       # Check LFI
       if req.body.match?(/(?i)[^\n]{0,100}(no such file|failed (to )?open)[^\n]{0,100}/)
         log(level: :heuristicLFI, message: "LFI found in: #{uri} (#{param[0]}) - Reflection Of Payload Vector (no such file)")
-        @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (no such file)", param: param[0] }
+        @vulnerable << {url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (no such file)", param: param[0]}
       elsif uri.path.include?("../")
         log(level: :heuristicLFI, message: "LFI found in: #{uri} (#{param[0]}) - Reflection Of Payload Vector (../)")
-        @vulnerable << { url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (../)", param: param[0] }
+        @vulnerable << {url: uri, type: "LFI", payload: "", response: "Reflection Of Payload Vector (../)", param: param[0]}
       end
       # # Check for Dynamic Pages
       # dynamicPay = SecureRandom.hex(8)
@@ -185,26 +186,22 @@ class Spider
       # Check for Passive SQLi
       sqliPayloads = ["'", "\""]
       sqliPayloads.each do |sqliPay|
-        newUri.query = URI.encode_www_form(params.map { |k, v| k == param[0] ? [k, sqliPay] : [k, v] })
+        newUri.query = URI.encode_www_form(params.map { |k, v| (k == param[0]) ? [k, sqliPay] : [k, v] })
         sqliReq = fetch(newUri)
         if sqliReq.body.match?(/(SQL syntax|Warning: mysql_|Unclosed quotation mark|quoted string not properly terminated|SQL error)/i)
           log(level: :heuristicSQLi, message: "SQLi found in: #{uri} (#{param[0]})")
-          @vulnerable << { url: uri, type: "SQLi", payload: sqliPay, response: "SQL error message detected", param: param[0] }
+          @vulnerable << {url: uri, type: "SQLi", payload: sqliPay, response: "SQL error message detected", param: param[0]}
         end
       end
-
     end
   rescue => e
     log(level: :error, message: "Error in heuristic: #{uri}\n#{e}\n#{e.backtrace}")
   end
-  
 
   def extractlinks(uri, body)
-    links = []
-    links = body.scan(/href=["'](.*?)["']/).flatten.each do |link|
+    body.scan(/href=["'](.*?)["']/).flatten.each do |link|
       next if link.nil? || link.empty? || link.start_with?("#")
     end
-    links
   end
 
   # def extractform(uri, body) # Cuz why not? :D
@@ -215,7 +212,7 @@ class Spider
     cookie = "CONSENT=YES+shp.gws-#{Time.new.strftime("%Y%m%d")}-0-RC1.#{SecureRandom.alphanumeric(2).downcase}+FX+740"
     uri = "https://www.google.com/search?q=#{URI.encode_uri_component(query)}&num=100&hl=en&complete=0&safe=off&filter=0&btnG=Search&start=#{page}"
     uri = URI.parse(uri)
-    req = fetch(uri, headers: { "Cookie" => cookie }, agent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:49.0) Gecko/20100101 Firefox/49.0")
+    req = fetch(uri, headers: {"Cookie" => cookie}, agent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:49.0) Gecko/20100101 Firefox/49.0")
     if req.nil? || req.body.nil?
       log(level: :error, message: "Error in dork: #{query}")
       return []
@@ -229,8 +226,8 @@ class Spider
     page = CGI.unescapeHTML(page)
     page.gsub!(/<script.*?>.*?<\/script>/m, "")
     page.gsub!(/<style.*?>.*?<\/style>/m, "")
-    page.gsub!(/&nbsp;/, " ")
-    page.gsub!(/&amp;/, "&")
+    page.gsub!("&nbsp;", " ")
+    page.gsub!("&amp;", "&")
     found = page.scan(/href="\/url\?esrc=s&q=&rct=j&sa=U&url=([^&]+)&ved=[^"]+" data-ved="[^"]+"/).flatten
     found.uniq
   rescue => e
@@ -258,7 +255,7 @@ class Spider
       return true if uri.host.nil? && uri.path.start_with?("/")
       return true if uri.host.nil? && uri.path.start_with?("../")
       return true if uri.host.nil? && uri.path.start_with?("./")
-    rescue => e
+    rescue
       # log(level: :error, message: "Error in inscope: #{uri} - #{scope}\n#{e}\n#{e.backtrace}")
       # puts("Go scream at Oak to fix this.")
     end
@@ -282,7 +279,6 @@ class Spider
       if !current.to_s.split(".").last.nil?
         next if @ignoredexts.include?(current.to_s.split(".").last)
       end
-      
 
       # puts(@settings[:inbound]
       # puts(@settings[:inbound].class)
@@ -330,11 +326,11 @@ class Spider
           forms = req.body.scan(/<form.*?action=["'](.*?)["'].*?method=["'](.*?)["'].*?>(.*?)<\/form>/m)
           forms.each do |form|
             action = form[0]
-            method = form[1].nil? || form[1].empty? ? "GET" : form[1].upcase
+            method = (form[1].nil? || form[1].empty?) ? "GET" : form[1].upcase
             inputs = req.body.scan(/<input.*?name=["'](.*?)["'].*?>/i).flatten
             if method == "GET"
               newUri = uri(action, current)
-              next if newUri.nil? 
+              next if newUri.nil?
               hash = URI.decode_www_form(newUri.query || "") + inputs.map { |i| [i, ""] }
               newUri.query = URI.encode_www_form(hash.to_h)
               next if newUri.nil? || newUri.query.nil?
@@ -348,7 +344,7 @@ class Spider
         rescue => e
           log(level: :error, message: "Unable to check forms for #{current} : #{stamp} seconds \n#{e}\n#{e.backtrace.join("\n")}")
         end
-        log(level: :httplog, message: "#{current.to_s} - #{req.msg} f(#{forms.size}) l(#{extracted.size}) - #{stamp} seconds", code: req.code)
+        log(level: :httplog, message: "#{current} - #{req.msg} f(#{forms.size}) l(#{extracted.size}) - #{stamp} seconds", code: req.code)
       end
     end
     # On finish
@@ -366,7 +362,7 @@ options = {
   "logreflection" => false,
   "dork" => nil,
   "page" => 0,
-  "url" => nil,
+  "url" => nil
 }
 
 spider = Spider.new(cookie: options["cookie"], threads: options["threads"].to_i, inbound: options["inbound"], logreflection: options["logreflection"])
@@ -375,7 +371,7 @@ spider = Spider.new(cookie: options["cookie"], threads: options["threads"].to_i,
 # spider.bot(2, "https://rawr.homes/waf?q=hi")
 
 ARGV.each do |arg|
-  next unless arg.start_with?("--") || arg.start_with?("-")
+  next unless arg.start_with?("--", "-")
   k, v = arg.split("=", 2)
   k = k[2..]
   # puts options
@@ -401,7 +397,6 @@ end
 
 spider = Spider.new(cookie: options["cookie"], threads: options["threads"].to_i, inbound: options["inbound"], logreflection: options["logreflection"])
 targets = []
-explored = []
 threads = []
 
 if options["dork"]
@@ -445,4 +440,3 @@ threads.each(&:join)
 spider.vulnerable.each do |vuln|
   spider.log(level: :info, message: "Vulnerable page: #{vuln[:url]} (#{vuln[:type]}) - #{vuln[:response]} - #{vuln[:param]}")
 end
-
