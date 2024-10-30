@@ -272,7 +272,7 @@ class SnowBlood
     uri = URI.parse(uri)
     req = fetch(uri, headers: { "Cookie" => cookie },
                      agent: "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:49.0) Gecko/20100101 Firefox/49.0")
-    puts req.inspect
+    # puts req.inspect
     if req.nil? || req.body.nil?
       log(level: :error, message: "Error in dork: #{query}")
       return []
@@ -294,7 +294,7 @@ class SnowBlood
     found = found.uniq
     # From Found, decode all the URL's
     # Aka turn https://example.com/%3Fparam=value into https://example.com/?param=value
-    puts found
+    # puts found
     newlist = []
     found.each do |url|
       url = URI.decode_uri_component(url)
@@ -689,7 +689,7 @@ end
 # Considering how many bot can be run at the same time
 
 newset.each do |target|
-  if bots.length >= settings["threads"]
+  if bots.length >= settings["threads"].to_i
     # Wait for a bot to finish
     bots.each(&:join)
     bots = []
